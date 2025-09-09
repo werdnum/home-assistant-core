@@ -958,3 +958,122 @@ async def test_webrtc_refresh_expired_stream(
         auth.captured_requests[1][2].get("command")
         == "sdm.devices.commands.CameraLiveStream.ExtendWebRtcStream"
     )
+
+
+@pytest.mark.usefixtures("webrtc_camera_device")
+async def test_webrtc_camera_snapshot_with_go2rtc(
+    hass: HomeAssistant,
+    setup_platform: PlatformSetup,
+    auth: FakeAuth,
+) -> None:
+    """Test WebRTC camera snapshot generation via go2rtc."""
+    # Mock go2rtc being available
+    hass.data["go2rtc"] = "http://localhost:1984"
+    
+    auth.responses = [
+        aiohttp.web.json_response(
+            {
+                "results": {
+                    "answerSdp": "v=0\r\ns=-\r\n",
+                    "expiresAt": "2022-01-01T00:05:00.000Z",
+                    "mediaSessionId": "test_session_id",
+                }
+            }
+        ),
+        aiohttp.web.json_response({}),
+    ]
+    
+    await setup_platform()
+    assert len(hass.states.async_all()) == 1
+    cam = hass.states.get("camera.my_camera")
+    assert cam is not None
+    assert cam.attributes.get(ATTR_FRIENDLY_NAME) == "My Camera"
+    
+    # Mock go2rtc client methods
+    with patch(
+        "homeassistant.components.nest.camera.Go2RtcRestClient"
+    ) as mock_go2rtc_class:
+        mock_go2rtc = AsyncMock()
+        mock_go2rtc_class.return_value = mock_go2rtc
+        
+        # Mock the streams operations
+        mock_go2rtc.streams = AsyncMock()
+        mock_go2rtc.streams.add = AsyncMock()
+        mock_go2rtc.streams.delete = AsyncMock()
+        
+        # Mock successful snapshot retrieval
+        test_image = b"test webrtc snapshot image"
+        mock_go2rtc.get_jpeg_snapshot = AsyncMock(return_value=test_image)
+        
+        # Get camera image - should use WebRTC snapshot
+        image = await async_get_image(hass)
+        
+        # Verify the snapshot was retrieved via go2rtc
+        assert image == test_image
+        assert mock_go2rtc.streams.add.called
+        assert mock_go2rtc.get_jpeg_snapshot.called
+        assert mock_go2rtc.streams.delete.called
+        
+        # Verify Nest API was called to generate WebRTC stream
+        assert len(auth.captured_requests) == 2
+        assert (
+            auth.captured_requests[0][2].get("command")
+            == "sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream"
+        )
+        assert (
+            auth.captured_requests[1][2].get("command")
+            == "sdm.devices.commands.CameraLiveStream.StopWebRtcStream"
+        )
+
+
+@pytest.mark.usefixtures("webrtc_camera_device")
+async def test_webrtc_camera_snapshot_fallback_to_placeholder(
+    hass: HomeAssistant,
+    setup_platform: PlatformSetup,
+    auth: FakeAuth,
+) -> None:
+    """Test WebRTC camera falls back to placeholder when go2rtc is not available."""
+    # No go2rtc configured
+    hass.data.pop("go2rtc", None)
+    
+    await setup_platform()
+    assert len(hass.states.async_all()) == 1
+    
+    # Get camera image - should return placeholder
+    image = await async_get_image(hass)
+    
+    # Read actual placeholder image for comparison
+    from homeassistant.components.nest.camera import PLACEHOLDER
+    placeholder_bytes = PLACEHOLDER.read_bytes()
+    
+    assert image == placeholder_bytes
+    # No Nest API calls should be made when go2rtc is not available
+    assert len(auth.captured_requests) == 0
+
+
+@pytest.mark.usefixtures("webrtc_camera_device")
+async def test_webrtc_camera_snapshot_error_handling(
+    hass: HomeAssistant,
+    setup_platform: PlatformSetup,
+    auth: FakeAuth,
+) -> None:
+    """Test WebRTC camera snapshot handles errors gracefully."""
+    # Mock go2rtc being available
+    hass.data["go2rtc"] = "http://localhost:1984"
+    
+    auth.responses = [
+        # Simulate API error
+        aiohttp.ClientError("API Error"),
+    ]
+    
+    await setup_platform()
+    assert len(hass.states.async_all()) == 1
+    
+    # Get camera image - should return placeholder on error
+    image = await async_get_image(hass)
+    
+    # Read actual placeholder image for comparison
+    from homeassistant.components.nest.camera import PLACEHOLDER
+    placeholder_bytes = PLACEHOLDER.read_bytes()
+    
+    assert image == placeholder_bytes

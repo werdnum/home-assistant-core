@@ -9,6 +9,7 @@ import datetime
 import functools
 import logging
 from pathlib import Path
+import secrets
 
 from google_nest_sdm.camera_traits import (
     CameraLiveStreamTrait,
@@ -27,9 +28,11 @@ from homeassistant.components.camera import (
     WebRTCClientConfiguration,
     WebRTCSendMessage,
 )
+from homeassistant.components.go2rtc import Go2RtcRestClient
 from homeassistant.components.stream import CONF_EXTRA_PART_WAIT_TIME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.util.dt import utcnow
@@ -264,8 +267,111 @@ class NestWebRTCEntity(NestCameraBaseEntity):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return a placeholder image for WebRTC cameras that don't support snapshots."""
+        """Return a snapshot image for WebRTC cameras via go2rtc."""
+        try:
+            # Try to get a real snapshot via go2rtc WebRTC connection
+            image = await self._async_get_webrtc_snapshot(width, height)
+            if image:
+                return image
+        except Exception as err:
+            _LOGGER.debug(
+                "Failed to get WebRTC snapshot for %s, using placeholder: %s",
+                self.entity_id,
+                err,
+            )
+        # Fallback to placeholder image
         return await self.hass.async_add_executor_job(self.placeholder_image)
+
+    @staticmethod
+    def _generate_minimal_offer_sdp() -> str:
+        """Generate a minimal WebRTC offer SDP for snapshot purposes."""
+        # This is a minimal SDP offer that requests video only
+        # The session ID and other dynamic values will be filled by the Nest API
+        session_id = secrets.token_hex(16)
+        return f"""v=0
+o=- {session_id} 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=extmap-allow-mixed
+a=msid-semantic: WMS
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=rtcp:9 IN IP4 0.0.0.0
+a=ice-ufrag:hass
+a=ice-pwd:hasshomeassistant{session_id}
+a=ice-options:trickle
+a=fingerprint:sha-256 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00
+a=setup:actpass
+a=mid:0
+a=recvonly
+a=rtcp-mux
+a=rtpmap:96 H264/90000
+a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"""
+
+    async def _async_get_webrtc_snapshot(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Get a snapshot via temporary WebRTC connection using go2rtc."""
+        # Check if go2rtc is available
+        go2rtc_url = self.hass.data.get("go2rtc")
+        if not go2rtc_url:
+            _LOGGER.debug("go2rtc not available for snapshot generation")
+            return None
+
+        # Generate a unique temporary stream ID
+        temp_stream_id = f"nest_snapshot_{self.entity_id}_{secrets.token_hex(8)}"
+        
+        try:
+            # Create go2rtc REST client
+            session = async_get_clientsession(self.hass)
+            go2rtc_client = Go2RtcRestClient(session, go2rtc_url)
+            
+            # Generate minimal offer SDP
+            offer_sdp = self._generate_minimal_offer_sdp()
+            
+            # Get WebRTC answer from Nest API
+            trait: CameraLiveStreamTrait = self._device.traits[
+                CameraLiveStreamTrait.NAME
+            ]
+            webrtc_stream = await trait.generate_web_rtc_stream(offer_sdp)
+            
+            try:
+                # Register the WebRTC stream with go2rtc
+                # Using the answer SDP as a WebRTC source
+                await go2rtc_client.streams.add(
+                    temp_stream_id,
+                    [f"webrtc:{webrtc_stream.answer_sdp}"],
+                )
+                
+                # Wait a moment for the stream to establish
+                await asyncio.sleep(1)
+                
+                # Get the snapshot from go2rtc
+                snapshot = await go2rtc_client.get_jpeg_snapshot(
+                    temp_stream_id, width, height
+                )
+                
+                return snapshot
+                
+            finally:
+                # Clean up: stop the Nest stream and remove from go2rtc
+                try:
+                    await webrtc_stream.stop_stream()
+                except ApiException:
+                    pass  # Ignore cleanup errors
+                
+                try:
+                    await go2rtc_client.streams.delete(temp_stream_id)
+                except Exception:
+                    pass  # Ignore cleanup errors
+                    
+        except ApiException as err:
+            _LOGGER.debug("Nest API error getting WebRTC snapshot: %s", err)
+            return None
+        except Exception as err:
+            _LOGGER.debug("Error getting WebRTC snapshot: %s", err)
+            return None
 
     @classmethod
     @functools.cache
